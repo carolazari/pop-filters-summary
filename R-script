@@ -1,0 +1,111 @@
+# Load packages
+library(vcfR)
+library(tidyverse)
+library(HardyWeinberg)
+
+### 1. Load per-site QC data ----
+
+maf <- read.table("your_file.frq", header = TRUE)
+depth <- read.table("your_file.idepth", header = TRUE)
+lmiss <- read.table("your_file.lmiss", header = TRUE)
+
+# Merge all site-level metrics
+site_data <- maf %>%
+  inner_join(depth, by = c("CHROM", "POS")) %>%
+  inner_join(lmiss, by = c("CHROM", "POS"))
+
+### 2. Load per-individual QC data ----
+
+het <- read.table("your_file.het", header = TRUE)
+imiss <- read.table("your_file.imiss", header = TRUE)
+ind_data <- het %>% inner_join(imiss, by = "IID")
+
+### 3. Load VCF and extract genotypes ----
+
+vcf <- read.vcfR("your_file.vcf")
+gt <- extract.gt(vcf, element = "GT", as.numeric = FALSE)
+vcf_sites <- data.frame(CHROM = vcf@fix[, "CHROM"], POS = as.numeric(vcf@fix[, "POS"]))
+
+### 4. Calculate HWE for all sites ----
+
+# Function to compute HWE stats
+calc_hwe <- function(genos) {
+  AA <- sum(genos %in% c("0/0", "0|0"))
+  AB <- sum(genos %in% c("0/1", "1/0", "0|1", "1|0"))
+  BB <- sum(genos %in% c("1/1", "1|1"))
+  total <- AA + AB + BB
+  if (total < 5) return(c(NA, NA, NA))
+  obs_het <- AB / total
+  af <- (2 * BB + AB) / (2 * total)
+  exp_het <- 2 * af * (1 - af)
+  pval <- tryCatch(HWChisq(c(AA, AB, BB), verbose = FALSE)$pval, error = function(e) NA)
+  return(c(obs_het, exp_het, pval))
+}
+
+# Apply to all sites
+hwe_stats <- apply(gt, 1, calc_hwe)
+hwe_df <- as.data.frame(t(hwe_stats))
+colnames(hwe_df) <- c("Obs_Het", "Exp_Het", "HWE_p")
+hwe_df$CHROM <- vcf_sites$CHROM
+hwe_df$POS <- vcf_sites$POS
+
+### 5. Merge HWE into site_data ----
+
+site_all <- site_data %>%
+  inner_join(hwe_df, by = c("CHROM", "POS"))
+
+### 6. Add QC flags ----
+
+maf_cutoff <- 0.45
+depth_cutoff <- quantile(site_all$MEAN_DEPTH, 0.95, na.rm = TRUE)
+miss_cutoff <- 0.1
+hwe_cutoff <- 0.001
+
+site_all <- site_all %>%
+  mutate(HighMAF = MAF >= maf_cutoff,
+         HighDepth = MEAN_DEPTH >= depth_cutoff,
+         HighMiss = F_MISS >= miss_cutoff,
+         HWE_Fail = HWE_p < hwe_cutoff,
+         ParalogFlag = case_when(
+           HighMAF & HighDepth & HWE_Fail ~ "MAF+Depth+HWE",
+           HighMAF & HighDepth ~ "MAF+Depth",
+           HighMAF & HWE_Fail ~ "MAF+HWE",
+           TRUE ~ "OK"
+         ))
+
+### 7. Add individual flags ----
+
+ind_data <- ind_data %>%
+  mutate(Flag = case_when(
+    F < -0.1 & F_MISS > 0.1 ~ "ExcessHet + HighMiss",
+    F < -0.1 ~ "ExcessHet",
+    F_MISS > 0.1 ~ "HighMiss",
+    TRUE ~ "OK"
+  ))
+
+### 8. Save outputs ----
+
+write.csv(site_all, "final_QC_sites.csv", row.names = FALSE)
+write.csv(ind_data, "final_QC_individuals.csv", row.names = FALSE)
+
+### 9. Optional: Visual diagnostics ----
+
+# Plot flagged sites
+ggplot(site_all, aes(x = MAF, y = MEAN_DEPTH, color = ParalogFlag)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Site QC: MAF vs Depth", x = "MAF", y = "Mean Depth")
+
+# HWE deviation plot
+ggplot(site_all, aes(x = Obs_Het - Exp_Het, y = MAF, color = ParalogFlag)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "HWE Deviation in High-MAF Sites",
+       x = "Observed - Expected Heterozygosity", y = "MAF")
+
+# Individual-level plot
+ggplot(ind_data, aes(x = F_MISS, y = F, color = Flag)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Individual QC: Missingness vs Inbreeding Coefficient",
+       x = "Missingness", y = "Inbreeding Coefficient (F)")
